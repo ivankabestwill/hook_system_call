@@ -1,0 +1,143 @@
+微信协程库libco研究：hook系统函数
+ 微信  协程  hook  c  c++  2.8k 次阅读  ·  读完需要 13 分钟
+最近花了一些时间研究微信的协程库libco，libco是微信后台大规模使用的c/c++协程库。库里面提供了socket族函数的hook，使得后台逻辑服务几乎不用修改逻辑代码就可以完成异步化改造，号称单机可以达到千万连接。
+
+有关libco库的具体实现原理后续有时间再讨论，本文先讨论微信团队实现对socket族函数的hook的技术细节。
+
+首先，我们先回顾一下程序链接相关的知识。
+
+静态链接
+在linux系统中，使用以下命令将源代码编译成可执行文件，源代码经过 预处理，编译，汇编，链接的过程最终生成可执行文件。一个简单的编译命令如下：
+gcc -o hello hello.c main.c -lcolib
+clipboard.png
+
+其中链接过程分为静态链接和动态链接。
+
+链接器可以将多个目标文件打包成一个单独的文件，称为库文件（有静态库和动态库）。
+静态链接是指在链接过程，将静态库文件中被引用的目标文件直接拷贝链接到可执行文件中。
+使用静态库有许多的缺点：
+
+可执行文件大小过大，造成硬盘的浪费
+如果库文件有更新，则依赖该库文件的可执行文件必须重新编译后，才能应用该更新
+假设有多个可执行文件都依赖于该库文件，那么每个可执行文件的.code段都会包含相同的机器码，造成内存的浪费
+而使用静态库的优点为 编译简单，且只链接使用到的目标文件。
+
+动态链接
+为了解决静态链接的缺点，就出现了动态链接的概念。动态库这个大家都不会陌生，比如Windows的dll文件，Linux的so文件。动态库加载后在系统中只会存有一份，所有依赖它的可执行文件都会共享动态库的code段，data段私有。
+动态链接的命令如下：
+gcc -o main main.o -L${libcolib.so path} -lcolib
+clipboard.png
+
+运行时动态链接
+系统为我们提供了 dlopen,dlsym工具，用于运行时加载动态库。可执行文件在运行时可以加载不同的动态库，这就为hook系统函数提供了基础。
+下面用一个小小的例子来说明如何利用dlsym工具hook系统函数。
+
+假设现在我们需要统计程序中malloc的调用次数，但是不能修改原有程序。最简单的思路类似于Java中动态代理Proxy的做法，先找到系统的malloc函数，然后将其替换为自定义的函数，在自定义函数中增加调用次数，并回调系统的原有malloc函数。
+
+例如我们要统计以下main.c中调用malloc的次数：
+
+// main.c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+    void *p = malloc(4);
+    free(p);
+    printf("hello world\n");
+    return 0;
+}
+为了能让自己的malloc函数回调系统的malloc函数，我们需要利用dlsym获取系统的malloc函数。
+
+// myhook.c
+#include <stdlib.h>
+#include <dlfcn.h>
+#include <stdio.h>
+
+static int count = 0;
+
+void *malloc(size_t size) {
+    void *(*myMalloc)(size_t) = dlsym(RTLD_NEXT, "malloc");
+    printf("call my malloc\n");
+    count++;
+    return myMalloc(size);
+}
+RTLD_NEXT允许从调用方链接映射列表中的下一个关联目标文件获取符号，即找到glibc.so中的malloc函数。
+
+下一步则是要让可执行文件main找到自定义的malloc函数。
+
+在linux操作系统的动态链接库的世界中，LD_PRELOAD就是这样一个环境变量，它可以影响程序的运行时的链接(Runtime linker)，它允许你定义在程序运行前优先加载的动态链接库。loader在进行动态链接的时候，会将有相同符号名的符号覆盖成LD_PRELOAD指定的so文件中的符号。换句话说，可以用我们自己的so库中的函数替换原来库里有的函数，从而达到hook的目的。
+编译：
+
+$ gcc -o main main.c
+$ gcc -o libmymalloc.so -fPIC -shared -D_GNU_SOURCE myhook.c -ld
+运行：
+
+$ LD_PRELOAD=./libmymalloc.so ./main
+call my malloc
+hello world
+至此，malloc函数的hook已经完成。
+
+不使用LD_PRELOAD的Hook
+这样就结束了吗？我们看看libco库是如何实现hook的呢，它的makefile中并没有LD_PRELOAD相关的信息。其秘密在于co_hook_sys_call.cpp，其将 co_enable_hook_sys()的定义在该cpp文件内，这样就把该文件的所有函数都导出了（即导出符号表）。
+
+//co_hook_sys_call.cpp
+ssize_t read(int fd, void* buf, size_t bytes) 
+{
+...
+}
+
+...
+
+void co_enable_hook_sys() //这函数必须在这里,否则本文件会被忽略！！！
+{
+    stCoRoutine_t *co = GetCurrThreadCo();
+    if( co )
+    {
+        co->cEnableSysHook = 1;
+    }
+}
+我们仍然以上面malloc的例子来说明：
+
+// main.c
+#include <stdio.h>
+#include <stdlib.h>
+#include "myhook.h"
+
+int main() {
+    enable_hook();
+    void *p = malloc(4);
+    free(p);
+    printf("hello world\n");
+    return 0;
+}
+// myhook.h
+int enable_hook(); 
+// myhook.c
+#include <stdlib.h>
+#include <dlfcn.h>
+#include <stdio.h>
+#include "myhook.h"
+
+static int count = 0;
+
+void *malloc(size_t size) {
+    void *(*myMalloc)(size_t) = dlsym(RTLD_NEXT, "malloc");
+    printf("call my malloc\n");
+    count++;
+    return myMalloc(size);
+}
+
+int enable_hook() {
+    return 1;
+}
+编译和运行：
+
+$ gcc -o libmymalloc.so -fPIC -shared -D_GNU_SOURCE myhook.c -ldl
+$ gcc -o main main.c -L./ -lmymalloc
+$ ./main
+call my malloc
+hello world
+这种方式算是对源代码进行了侵入，必须调用特定的函数(即本例中的enable_hook())，才能将hook的函数导出，并链接到现有的可执行文件的内存空间中。
+
+总结
+libco库通过非LD_PRELOAD的方法，将网络相关的read，write...等方法进行hook后，将其改造成异步操作，即相关调用阻塞后让出cpu，让其他协程继续处理，从而达到异步化的效果。libco的具体实现后续再介绍。
