@@ -1,0 +1,973 @@
+1. 系统调用Hook简介
+
+系统调用属于一种软中断机制(内中断陷阱)，它有操作系统提供的功能入口(sys_call)以及CPU提供的硬件支持(int 3 trap)共同完成。
+
+我们必须要明白，Hook技术是一个相对较宽的话题，因为操作系统从ring3到ring0是分层次的结构，在每一个层次上都可以进行相应的Hook，它们使用的技术方法以及取得的效果也是不尽相同的。本文的主题是'系统调用的Hook学习'，'系统调用的Hook'是我们的目的，而要实现这个目的可以有很多方法，本文试图尽量覆盖从ring3到ring0中所涉及到的Hook技术，来实现系统调用的监控功能。
+
+2. Ring3中Hook技术
+
+0x1: LD_PRELOAD动态连接.so函数劫持
+
+在linux操作系统的动态链接库的世界中，LD_PRELOAD就是这样一个环境变量，它可以影响程序的运行时的链接(Runtime linker)，它允许你定义在程序运行前优先加载的动态链接库。loader在进行动态链接的时候，会将有相同符号名的符号覆盖成LD_PRELOAD指定的so文件中的符号。换句话说，可以用我们自己的so库中的函数替换原来库里有的函数，从而达到hook的目的。这和:
+
+view sourceprint?
+1.
+1. Windows下通过修改import table来hook API
+2.
+2. PHP中修改functions_table来hook function
+从原理上来讲很类似。
+
+我们知道，Linux的用C库的都是glibc，有一个叫libc.so.6的文件，这是几乎所有Linux下命令的动态链接中，其中有标准C的各种函数，默认情况下，linux所编译的程序中对标准C函数的链接，都是通过动态链接方式来链接libc.so.6这个函数库的。这也意味着我们在通过我们注入的.so来实现函数覆盖劫持之后需要从libc.so.6中取得原本的正常函数，让程序继续正常执行
+
+正常程序main.c:
+
+view sourceprint?
+01.
+#include <stdio.h>
+02.
+#include <string.h>
+03.
+ 
+04.
+int main(int argc, char *argv[])
+05.
+{
+06.
+if( strcmp(argv[1], 'test') )
+07.
+{
+08.
+printf('Incorrect password
+09.
+');
+10.
+}
+11.
+else
+12.
+{
+13.
+printf('Correct password
+14.
+');
+15.
+}
+16.
+return 0;
+17.
+}
+用于劫持函数的.so代码hook.c
+
+view sourceprint?
+01.
+#include <stdio.h>
+02.
+#include <string.h>
+03.
+#include <dlfcn.h>
+04.
+/*
+05.
+hook的目标是strcmp，所以typedef了一个STRCMP函数指针
+06.
+hook的目的是要控制函数行为，从原库libc.so.6中拿到strcmp指针，保存成old_strcmp以备调用
+07.
+*/
+08.
+typedef int(*STRCMP)(const char*, const char*);
+09.
+ 
+10.
+int strcmp(const char *s1, const char *s2)
+11.
+{
+12.
+static void *handle = NULL;
+13.
+static STRCMP old_strcmp = NULL;
+14.
+ 
+15.
+if( !handle )
+16.
+{
+17.
+handle = dlopen('libc.so.6', RTLD_LAZY);
+18.
+old_strcmp = (STRCMP)dlsym(handle, 'strcmp');
+19.
+}
+20.
+printf('oops!!! hack function invoked. s1=<%s> s2=<%s>
+21.
+', s1, s2);
+22.
+return old_strcmp(s1, s2);
+23.
+}
+编译：
+
+view sourceprint?
+1.
+gcc -o test main.c
+2.
+gcc -fPIC -shared -o hook.so hook.c -ldl
+运行:
+
+view sourceprint?
+1.
+LD_PRELOAD=./hook.so ./test 123
+ 
+
+0x2:  ...
+
+3. Ring0中Hook技术
+
+0x1: Kernel Inline Hook
+
+传统的kernel inline hook技术就是修改内核函数的opcode，通过写入jmp或push ret等指令跳转到新的内核函数中，从何达到劫持的目的。对于这类劫持攻击，目前常见的做法是fireeye的'函数返回地址污点检测'，通过对原有指令返回位置的汇编代码作污点标记，通过查找jmp，push ret等指令来进行防御
+
+我们知道实现一个系统调用的函数中一定会递归的嵌套有很多的子函数，即它必定要调用它的下层函数。
+而从汇编的角度来说，对一个子函数的调用是采用'段内相对短跳转 jmp offset'来实现的，即CPU根据offset来进行一个偏移量的跳转。
+如果我们把下层函数在上层函数中的offset替换成我们'Hook函数'的offset，这样上层函数调用下层函数时，就会跳到我们的'Hook函数'中，我们就可以在'Hook函数'中做过滤和劫持内容的工作
+
+以sys_read作为例子
+
+linux-2.6.32.63s ead_write.c
+
+view sourceprint?
+01.
+asmlinkage ssize_t sys_read(unsigned int fd, char __user * buf, size_t count)
+02.
+{
+03.
+struct file *file;
+04.
+ssize_t ret = -EBADF;
+05.
+int fput_needed;
+06.
+ 
+07.
+file = fget_light(fd, &fput_needed);
+08.
+if (file)
+09.
+{
+10.
+loff_t pos = file_pos_read(file);
+11.
+ret = vfs_read(file, buf, count, &pos);
+12.
+file_pos_write(file, pos);
+13.
+fput_light(file, fput_needed);
+14.
+}
+15.
+ 
+16.
+return ret;
+17.
+}
+18.
+EXPORT_SYMBOL_GPL(sys_read);
+在sys_read()中，调用了子函数vfs_read()来完成读取数据的操作，在sys_read()中调用子函数vfs_read()的汇编命令是:
+call 0xc106d75c <vfs_read>
+等同于:
+jmp offset(相对于sys_read()的基址偏移)
+所以，我们的思路很明确，找到call   0xc106d75c <vfs_read>这条汇编，把其中的offset改成我们的Hook函数对应的offset，就可以实现劫持目的了
+
+view sourceprint?
+1.
+1. 搜索sys_read的opcode
+2.
+2. 如果发现是call指令，根据call后面的offset计算要跳转的地址是不是我们要hook的函数地址
+3.
+1) 如果'不是'就重新计算Hook函数的offset，用Hook函数的offset替换原来的offset
+4.
+2) 如果'已经是'Hook函数的offset，则说明函数已经处于被劫持状态了，我们的Hook引擎应该直接忽略跳过，避免重复劫持
+poc:
+
+view sourceprint?
+01.
+/*
+02.
+参数：
+03.
+1. handler是上层函数的地址，这里就是sys_read的地址
+04.
+2. old_func是要替换的函数地址，这里就是vfs_read
+05.
+3. new_func是新函数的地址，这里就是new_vfs_read的地址
+06.
+*/
+07.
+unsigned int patch_kernel_func(unsigned int handler, unsigned int old_func,
+08.
+unsigned int new_func)
+09.
+{
+10.
+unsigned char *p = (unsigned char *)handler;
+11.
+unsigned char buf[4] = '';
+12.
+unsigned int offset = 0;
+13.
+unsigned int orig = 0;
+14.
+int i = 0;
+15.
+ 
+16.
+DbgPrint('
+17.
+*** hook engine: start patch func at: 0x%08x
+18.
+', old_func);
+19.
+ 
+20.
+while (1) {
+21.
+if (i > 512)
+22.
+return 0;
+23.
+ 
+24.
+if (p[0] == 0xe8) {
+25.
+DbgPrint('*** hook engine: found opcode 0x%02x
+26.
+', p[0]);
+27.
+ 
+28.
+DbgPrint('*** hook engine: call addr: 0x%08x
+29.
+',
+30.
+(unsigned int)p);
+31.
+buf[0] = p[1];
+32.
+buf[1] = p[2];
+33.
+buf[2] = p[3];
+34.
+buf[3] = p[4];
+35.
+ 
+36.
+DbgPrint('*** hook engine: 0x%02x 0x%02x 0x%02x 0x%02x
+37.
+',
+38.
+p[1], p[2], p[3], p[4]);
+39.
+ 
+40.
+offset = *(unsigned int *)buf;
+41.
+DbgPrint('*** hook engine: offset: 0x%08x
+42.
+', offset);
+43.
+ 
+44.
+orig = offset + (unsigned int)p + 5;
+45.
+DbgPrint('*** hook engine: original func: 0x%08x
+46.
+', orig);
+47.
+ 
+48.
+if (orig == old_func) {
+49.
+DbgPrint('*** hook engine: found old func at'
+50.
+' 0x%08x
+51.
+',
+52.
+old_func);
+53.
+ 
+54.
+DbgPrint('%d
+55.
+', i);
+56.
+break;
+57.
+}
+58.
+}
+59.
+p++;
+60.
+i++;
+61.
+}
+62.
+ 
+63.
+offset = new_func - (unsigned int)p - 5;
+64.
+DbgPrint('*** hook engine: new func offset: 0x%08x
+65.
+', offset);
+66.
+ 
+67.
+p[1] = (offset & 0x000000ff);
+68.
+p[2] = (offset & 0x0000ff00) >> 8;
+69.
+p[3] = (offset & 0x00ff0000) >> 16;
+70.
+p[4] = (offset & 0xff000000) >> 24;
+71.
+ 
+72.
+DbgPrint('*** hook engine: pachted new func offset.
+73.
+');
+74.
+ 
+75.
+return orig;
+76.
+}
+0x2: 利用0x80中断劫持system_call->sys_call_table进行系统调用Hook
+
+我们知道，要对系统调用(sys_call_table)进行替换，却必须要获取该地址后才可以进行替换。但是Linux 2.6版的内核出于安全的考虑没有将系统调用列表基地址的符号sys_call_table导出，但是我们可以采取一些hacking的方式进行获取。
+因为系统调用都是通过0x80中断来进行的，故可以通过查找0x80中断的处理程序来获得sys_call_table的地址。其基本步骤是
+
+view sourceprint?
+1.
+1. 获取中断描述符表(IDT)的地址(使用C ASM汇编)
+2.
+2. 从中查找0x80中断(系统调用中断)的服务例程(8*0x80偏移)
+3.
+3. 搜索该例程的内存空间，
+4.
+4. 从其中获取sys_call_table(保存所有系统调用例程的入口地址)的地址
+编程示例
+
+find_sys_call_table.c
+
+view sourceprint?
+01.
+#include <linux/module.h>
+02.
+#include <linux/kernel.h>
+03.
+ 
+04.
+// 中断描述符表寄存器结构
+05.
+struct
+06.
+{
+07.
+unsigned short limit;
+08.
+unsigned int base;
+09.
+} __attribute__((packed)) idtr;
+10.
+ 
+11.
+ 
+12.
+// 中断描述符表结构
+13.
+struct
+14.
+{
+15.
+unsigned short off1;
+16.
+unsigned short sel;
+17.
+unsigned char none, flags;
+18.
+unsigned short off2;
+19.
+} __attribute__((packed)) idt;
+20.
+ 
+21.
+// 查找sys_call_table的地址
+22.
+void disp_sys_call_table(void)
+23.
+{
+24.
+unsigned int sys_call_off;
+25.
+unsigned int sys_call_table;
+26.
+char* p;
+27.
+int i;
+28.
+ 
+29.
+// 获取中断描述符表寄存器的地址
+30.
+asm('sidt %0':'=m'(idtr));
+31.
+printk('addr of idtr: %x
+32.
+', &idtr);
+33.
+ 
+34.
+// 获取0x80中断处理程序的地址
+35.
+memcpy(&idt, idtr.base+8*0x80, sizeof(idt));
+36.
+sys_call_off=((idt.off2<<16)|idt.off1);
+37.
+printk('addr of idt 0x80: %x
+38.
+', sys_call_off);
+39.
+ 
+40.
+// 从0x80中断服务例程中搜索sys_call_table的地址
+41.
+p=sys_call_off;
+42.
+for (i=0; i<100; i++)
+43.
+{
+44.
+if (p=='ÿ' && p[i+1]=='' && p[i+2]=='?')
+45.
+{
+46.
+sys_call_table=*(unsigned int*)(p+i+3);
+47.
+printk('addr of sys_call_table: %x
+48.
+', sys_call_table);
+49.
+return ;
+50.
+}
+51.
+}
+52.
+}
+53.
+ 
+54.
+// 模块载入时被调用
+55.
+static int __init init_get_sys_call_table(void)
+56.
+{
+57.
+disp_sys_call_table();
+58.
+return 0;
+59.
+}
+60.
+ 
+61.
+module_init(init_get_sys_call_table);
+62.
+ 
+63.
+// 模块卸载时被调用
+64.
+static void __exit exit_get_sys_call_table(void)
+65.
+{
+66.
+}
+67.
+ 
+68.
+module_exit(exit_get_sys_call_table);
+69.
+ 
+70.
+// 模块信息
+71.
+MODULE_LICENSE('GPL2.0');
+72.
+MODULE_AUTHOR('LittleHann');
+Makefile
+
+view sourceprint?
+1.
+obj-m := find_sys_call_table.o
+编译
+
+view sourceprint?
+1.
+make -C /usr/src/kernels/2.6.32-358.el6.i686 M=$(pwd) modules
+测试效果
+
+dmesg| tail
+
+ 
+
+获取到了sys_call_table的基地址之后，我们就可以修改指定offset对应的系统调用了，从而达到劫持系统调用的目的
+
+0x3: 获取sys_call_table的其他方法
+
+1. 常用方法
+
+模拟出一个call *sys_call_table(,%eax,4)，然后看其机器码，然后在system_call的附近基于这个特征进行寻找
+
+view sourceprint?
+01.
+#include <stdio.h>
+02.
+void fun1()
+03.
+{
+04.
+printf('fun1/n');
+05.
+}
+06.
+void fun2()
+07.
+{
+08.
+printf('fun2/n');
+09.
+}
+10.
+unsigned int sys_call_table[2] = {fun1, fun2};
+11.
+int main(int argc, char **argv)
+12.
+{
+13.
+asm('call *sys_call_table(%eax,4');
+14.
+}
+15.
+ 
+16.
+编译
+17.
+gcc test.c -o test
+18.
+ 
+19.
+objdump进行dump
+20.
+objdump -D ./test | grep sys_call_table
+2. 通过/boot/System.map-2.6.32-358.el6.i686文件查找
+
+view sourceprint?
+1.
+cd /boot
+2.
+grep sys_call_table System.map-2.6.32-358.el6.i686
+0x4: 利用Linux内核机制kprobe机制进行系统调用Hook
+
+kprobe简介
+
+kprobe是一个动态地收集调试和性能信息的工具，它从Dprobe项目派生而来，它几乎可以跟踪任何函数或被执行的指令以及一些异步事件。它的基本工作机制是:
+
+view sourceprint?
+1.
+1. 用户指定一个探测点，并把一个用户定义的处理函数关联到该探测点
+2.
+2. 在注册探测点的时候，对被探测函数的指令码进行替换，替换为int 3的指令码
+3.
+3. 在执行int 3的异常执行中，通过通知链的方式调用kprobe的异常处理函数
+4.
+4. 在kprobe的异常出来函数中，判断是否存在pre_handler钩子，存在则执行
+5.
+5. 执行完后，准备进入单步调试，通过设置EFLAGS中的TF标志位，并且把异常返回的地址修改为保存的原指令码
+6.
+6. 代码返回，执行原有指令，执行结束后触发单步异常
+7.
+7. 在单步异常的处理中，清除单步标志，执行post_handler流程，并最终返回
+从原理上来说，kprobe的这种机制属于系统提供的'回调订阅'，和netfilter是类似的，linux内核通过在某些代码执行流程中给出回调函数接口供程序员订阅，内核开发人员可以在这些回调点上注册(订阅)自定义的处理函数，同时还可以获取到相应的状态信息，方便进行过滤、分析
+kprobe实现了三种类型的探测点:
+
+view sourceprint?
+1.
+1. kprobes
+2.
+kprobes是可以被插入到内核的任何指令位置的探测点，kprobe允许在同一地址注册多个kprobes，但是不能同时在该地址上有多个jprobes
+3.
+ 
+4.
+2. jprobes
+5.
+jprobes则只能被插入到一个内核函数的入口
+6.
+ 
+7.
+3. kretprobes(也叫返回探测点)
+8.
+而kretprobes则是在指定的内核函数返回时才被执行
+在本文中，我们可以使用kprobe的程序实现作一个内核模块，模块的初始化函数来负责安装探测点，退出函数卸载那些被安装的探测点。kprobe提供了接口函数(APIs)来安装或卸载探测点。目前kprobe支持如下架构：i386、x86_64、ppc64、ia64(不支持对slot1指令的探测)、sparc64 (返回探测还没有实现)
+kprobe实现原理
+
+1. kprobes
+
+view sourceprint?
+01.
+/*
+02.
+kprobes执行流程
+03.
+*/
+04.
+1. 当安装一个kprobes探测点时，kprobe首先备份被探测的指令
+05.
+2. 使用断点指令(int 3指令)来取代被探测指令的头一个或几个字节(这点和OD很像)
+06.
+3. CPU执行到探测点时，将因运行断点指令而执行trap操作，那将导致保存CPU的寄存器，调用相应的trap处理函数
+07.
+4. trap处理函数将调用相应的notifier_call_chain(内核中一种异步工作机制)中注册的所有notifier函数
+08.
+5. kprobe正是通过向trap对应的notifier_call_chain注册关联到探测点的处理函数来实现探测处理的
+09.
+6. 当kprobe注册的notifier被执行时
+10.
+6.1 它首先执行关联到探测点的pre_handler函数，并把相应的kprobe struct和保存的寄存器作为该函数的参数
+11.
+6.2 然后，kprobe单步执行被探测指令的备份(原始函数)
+12.
+6.3 最后，kprobe执行post_handler
+13.
+7. 等所有这些运行完毕后，紧跟在被探测指令后的指令流将被正常执行
+#include linux/kprobes.h
+
+view sourceprint?
+1.
+int register_kprobe(struct kprobe *kp);
+2.
+ 
+3.
+int pre_handler(struct kprobe *p, struct pt_regs *regs);
+4.
+void post_handler(struct kprobe *p, struct pt_regs *regs,
+5.
+unsigned long flags);
+6.
+<em><strong>fault_handler()
+7.
+</strong></em>
+整个顺序为：
+
+pre_handler->被Hook原函数->post_handler
+
+2. jprobe
+
+view sourceprint?
+01.
+/*
+02.
+jprobe执行流程
+03.
+*/
+04.
+1. jprobe通过注册kprobes在被探测函数入口的来实现，它能无缝地访问被探测函数的参数
+05.
+2. jprobe处理函数应当和被探测函数有同样的原型，而且该处理函数在函数末必须调用kprobe提供的函数jprobe_return()
+06.
+3. 当执行到该探测点时，kprobe备份CPU寄存器和栈的一些部分，然后修改指令寄存器指向jprobe处理函数
+07.
+4. 当执行该jprobe处理函数时，寄存器和栈内容与执行真正的被探测函数一模一样，因此它不需要任何特别的处理就能访问函数参数， 在该处理函数执行到最后
+08.
+时，它调用jprobe_return()，那导致寄存器和栈恢复到执行探测点时的状态，因此被探测函数能被正常运行
+09.
+5. 需要注意，被探测函数的参数可能通过栈传递，也可能通过寄存器传递，但是jprobe对于两种情况都能工作，因为它既备份了栈，又备份了寄存器，当然，前提
+10.
+是jprobe处理函数原型必须与被探测函数完全一样
+#include linux/kprobes.h
+
+view sourceprint?
+1.
+int register_jprobe(struct jprobe *jp);
+3. kretprobe
+
+view sourceprint?
+01.
+/*
+02.
+kretprobe执行流程
+03.
+*/
+04.
+1. kretprobe也使用了kprobes来实现2
+05.
+2. 当用户调用register_kretprobe()时，kprobe在被探测函数的入口建立了一个探测点
+06.
+3. 当执行到探测点时，kprobe保存了被探测函数的返回地址并取代返回地址为一个trampoline的地址，kprobe在初始化时定义了该trampoline并且为该
+07.
+trampoline注册了一个kprobe
+08.
+4. 当被探测函数执行它的返回指令时，控制传递到该trampoline，因此kprobe已经注册的对应于trampoline的处理函数将被执行，而该处理函数会调用用户
+09.
+关联到该kretprobe上的处理函数
+10.
+5. 处理完毕后，设置指令寄存器指向已经备份的函数返回地址，因而原来的函数返回被正常执行。
+11.
+6. 被探测函数的返回地址保存在类型为kretprobe_instance的变量中，结构kretprobe的maxactive字段指定了被探测函数可以被同时探测的实例数
+12.
+7. 函数register_kretprobe()将预分配指定数量的kretprobe_instance:
+13.
+7.1 如果被探测函数是非递归的并且调用时已经保持了自旋锁(spinlock)，那么maxactive为1就足够了
+14.
+7.2 如果被探测函数是非递归的且运行时是抢占失效的，那么maxactive为NR_CPUS就可以了
+15.
+7.3 如果maxactive被设置为小于等于0, 它被设置到缺省值(如果抢占使能， 即配置了 CONFIG_PREEMPT，缺省值为10和2*NR_CPUS中的最大值，否则
+16.
+缺省值为NR_CPUS)
+17.
+7.4 如果maxactive被设置的太小了，一些探测点的执行可能被丢失，但是不影响系统的正常运行，在结构kretprobe中nmissed字段将记录被丢失的探测
+18.
+点执行数，它在返回探测点被注册时设置为0，每次当执行探测函数而没有kretprobe_instance可用时，它就加1
+#include linux/kprobes.h
+
+view sourceprint?
+1.
+int register_kretprobe(struct kretprobe *rp);
+2.
+ 
+3.
+int kretprobe_handler(struct kretprobe_instance *ri, struct pt_regs *regs);
+对应于每一个注册函数，有相应的卸载函数
+
+view sourceprint?
+1.
+void unregister_kprobe(struct kprobe *kp);
+2.
+void unregister_jprobe(struct jprobe *jp);
+3.
+void unregister_kretprobe(struct kretprobe *rp);
+了解了kprobe的基本原理之后，我们要回到我们本文的主题，系统调用的Hook上来，由于kprobe是linux提供的稳定的回调注册机制，linux天生就稳定地支持在我们指定的某个函数的执行流上进行注册回调，我们很方便地使用它来进行系统调用(例如sys_execv()、网络连接等)的执行Hook，从而劫持linux系统的系统调用流程，为下一步的恶意入侵行为分析作准备
+
+kprobe编程示例
+
+do_fork.c
+
+view sourceprint?
+01.
+/*
+02.
+* * You will see the trace data in /var/log/messages and on the console
+03.
+* * whenever do_fork() is invoked to create a new process.
+04.
+* */
+05.
+ 
+06.
+#include <linux/kernel.h>
+07.
+#include <linux/module.h>
+08.
+#include <linux/kprobes.h>
+09.
+ 
+10.
+//定义要Hook的函数，本例中do_fork
+11.
+static struct kprobe kp =
+12.
+{
+13.
+.symbol_name = 'do_fork',
+14.
+};
+15.
+ 
+16.
+static int handler_pre(struct kprobe *p, struct pt_regs *regs)
+17.
+{
+18.
+struct thread_info *thread = current_thread_info();
+19.
+ 
+20.
+printk(KERN_INFO 'pre-handler thread info: flags = %x, status = %d, cpu = %d, task->pid = %d
+21.
+',
+22.
+thread->flags, thread->status, thread->cpu, thread->task->pid);
+23.
+ 
+24.
+return 0;
+25.
+}
+26.
+ 
+27.
+static void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
+28.
+{ 
+29.
+struct thread_info *thread = current_thread_info();
+30.
+ 
+31.
+printk(KERN_INFO 'post-handler thread info: flags = %x, status = %d, cpu = %d, task->pid = %d
+32.
+',
+33.
+thread->flags, thread->status, thread->cpu, thread->task->pid);
+34.
+}
+35.
+ 
+36.
+static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapnr)
+37.
+{
+38.
+printk(KERN_INFO 'fault_handler: p->addr = 0x%p, trap #%dn',
+39.
+p->addr, trapnr);
+40.
+return 0;
+41.
+}
+42.
+ 
+43.
+/*
+44.
+内核模块加载初始化，这个过程和windows下的内核驱动注册分发例程很类似
+45.
+*/
+46.
+static int __init kprobe_init(void)
+47.
+{
+48.
+int ret;
+49.
+kp.pre_handler = handler_pre;
+50.
+kp.post_handler = handler_post;
+51.
+kp.fault_handler = handler_fault;
+52.
+ 
+53.
+ret = register_kprobe(&kp);
+54.
+if (ret < 0)
+55.
+{
+56.
+printk(KERN_INFO 'register_kprobe failed, returned %d
+57.
+', ret);
+58.
+return ret;
+59.
+}
+60.
+printk(KERN_INFO 'Planted kprobe at %p
+61.
+', kp.addr);
+62.
+return 0;
+63.
+}
+64.
+ 
+65.
+static void __exit kprobe_exit(void)
+66.
+{
+67.
+unregister_kprobe(&kp);
+68.
+printk(KERN_INFO 'kprobe at %p unregistered
+69.
+', kp.addr);
+70.
+}
+71.
+ 
+72.
+module_init(kprobe_init)
+73.
+module_exit(kprobe_exit)
+74.
+MODULE_LICENSE('GPL');
+Makefile
+
+view sourceprint?
+1.
+obj-m := do_fork.o
+编译:
+
+view sourceprint?
+1.
+make -C /usr/src/kernels/2.6.32-358.el6.i686 M=$(pwd) modules
+加载内核模块:
+
+view sourceprint?
+1.
+insmod do_fork.ko
+测试效果：
+
+dmesg| tail
+
+ 
+
+cat /proc/kallsyms | grep do_fork
+
+ 
+
+do_fork的地址与kprobe注册的地址一致，可见，在kprobe调试模块在内核停留期间，我们编写的内核监控模块劫持并记录了系统fork出了新的进程信息
+
+4. 后记
+
+Hook技术是进行主动防御、动态入侵检测的关键技术，从技术上来说，目前的很多Hook技术都属于'猥琐流'，即：
+
+view sourceprint?
+1.
+1. 通过'劫持'在关键流程上的某些函数的执行地址，在Hook函数执行完之后，再跳回原始的函数继续执行(做好现场保护)
+2.
+2. 或者通过dll、进程、线程注入比原始程序提前获得CPU执行权限
+但是随着windows的PatchGuard的出现，这些出于'安全性'的内核patct将被一视同仁地看作内核完整性的威胁者
+
+更加优美、稳定的方法应该是:
+
+view sourceprint?
+01.
+1. 注册标准的回调方法，包括:
+02.
+1) 进程
+03.
+2) 线程
+04.
+3) 模块的创建
+05.
+4) 卸载回调函数
+06.
+5) 文件/网络等各种过滤驱动 2. 内核提供的标准处理流程Hook点
+07.
+1) kprobe机制
+08.
+2. 网络协议栈提供的标准Hook点
+09.
+1) netfilter的链式处理流程
+Copyright (c) 2014 LittleHann All rights reserved
